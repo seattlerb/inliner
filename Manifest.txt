@@ -1,0 +1,7 @@
+History.txt
+Manifest.txt
+README.txt
+Rakefile
+bin/inliner
+lib/inliner.rb
+test/test_inliner.rb
