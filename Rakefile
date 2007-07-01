@@ -5,7 +5,7 @@ require 'hoe'
 require './lib/inliner.rb'
 
 Hoe.new('Inliner', Inliner::VERSION) do |p|
-  p.rubyforge_name = 'Inliner'
+  p.rubyforge_name = 'seattlerb'
   p.author = 'Eric Hodel'
   p.email = 'drbrain@segment7.net'
   # p.summary = 'FIX'
@@ -13,8 +13,8 @@ Hoe.new('Inliner', Inliner::VERSION) do |p|
   # p.url = p.paragraphs_of('README.txt', 0).first.split(/\n/)[1..-1]
   p.changes = p.paragraphs_of('History.txt', 0..1).join("\n\n")
 
-  p.extra_deps << 'Ruby2Ruby'
-  p.extra_deps << 'RubyInline'
+  p.extra_deps << ['ruby2ruby', '>= 1.1.6']
+  p.extra_deps << ['RubyInline', '>= 3.6.3']
 end
 
 # vim: syntax=Ruby

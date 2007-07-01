@@ -3,6 +3,8 @@ require 'ruby2ruby'
 
 class Inliner < RubyToRuby
 
+  class Error < RuntimeError; end
+
   ##
   # The version of Inliner you are using.
 
@@ -10,7 +12,7 @@ class Inliner < RubyToRuby
 
   attr_accessor :defn_name
 
-  @@signature = :fuck
+  @@signature = :bogus
   @@threshold = 500
   @@sacred = {
     Sexp => true,
@@ -18,26 +20,49 @@ class Inliner < RubyToRuby
   @@skip = Hash.new(false)
   # { klass => { [kaller, kallee] => count } }
   @@data = Hash.new { |h,klass| h[klass] = Hash.new(0) }
+  @@debug = false
 
   def self.data
     @@data
   end
 
+  def self.debug() @@debug || $DEBUG end
+  def self.debug=(v) @@debug = v end
+
+  def self.inline_during(wait, duration)
+    Thread.start do
+      sleep wait
+      start_inlining
+      sleep duration
+      stop_inlining
+    end
+  end
+
   def self.inline_into(signature)
+    return if @@skip.include? signature
+
     klass, kaller, kallee = *signature
 
-    unless @@sacred.include? klass then
-      $stderr.puts "*** Inliner threshold tripped for #{klass} #{kallee} -> #{kaller}"
+    return if @@sacred.include? klass
 
-      begin
-        new.inline_into klass, kaller, kallee
-      rescue Exception => e
-        $stderr.puts "Failed to inline #{klass} #{kallee} -> #{kaller}"
-        $stderr.puts "Exception = #{e.class}, message = #{e.message}"
-      end
+    log "Inliner threshold tripped for #{klass} #{kallee} -> #{kaller}"
+
+    begin
+      new.inline_into klass, kaller, kallee
+    rescue Exception => e
+      log "Failed to inline #{klass} #{kallee} -> #{kaller}"
+      log "Exception = #{e.class}, message = #{e.message}"
     end
 
     @@skip[signature] = true
+  end
+
+  def self.log(message)
+    $stderr.puts message if debug
+  end
+
+  def self.sacred
+    @@sacred
   end
 
   def self.signature
@@ -45,15 +70,15 @@ class Inliner < RubyToRuby
   end
 
   def self.start_inlining
+    log "starting inlining"
     add_event_hook
   end
 
   def self.stop_inlining
     remove_event_hook
-    if $DEBUG then
-      $stderr.puts @@skip.inspect
-      $stderr.puts @@data.inspect
-    end
+    log "stopped inlining"
+    log @@skip.inspect
+    log @@data.inspect
   end
 
   def initialize
@@ -64,6 +89,10 @@ class Inliner < RubyToRuby
 
   def extract_expression(klass, kallee)
     kallee_sexp = Sexp.for klass, kallee
+
+    # HACK Sexp#=~ sucks
+    kallee_sexp.each_of_type(:yield) { raise Error, "yield gets slower" }
+    kallee_sexp.each_of_type(:return) { raise Error, "return unsupported" }
 
     kallee_args = nil
     kallee_sexp.each_of_type(:args) { |a| kallee_args = a }
@@ -79,56 +108,99 @@ class Inliner < RubyToRuby
       args.last[-1] = star_arg.intern
     end
 
+    block_arg = nil
+    kallee_sexp.each_of_type(:block_arg) do |ba| 
+      block_arg = s(:lasgn, rename(ba.last))
+    end
+
     args = s(:array, *args)
     @defn_name = nil
 
     body_defn = rewrite kallee_sexp
     body_expr = body_defn.scope.block
 
-    return args, defaults, body_expr
+    return args, block_arg, defaults, body_expr
   end
 
   def inline_into(klass, kaller, kallee)
-    args, defaults, inlined_body = extract_expression klass, kallee
+    vars, block_var, defaults, inlined_body = extract_expression klass, kallee
 
-    inlined_sexp = replace_fcalls klass, kaller, kallee,
-                                  args, defaults, inlined_body
-
-    kaller_ruby = RubyToRuby.new.process inlined_sexp
-
-    klass.class_eval kaller_ruby
-  end
-
-  def replace_fcalls(klass, kaller, kallee, vars, defaults, inlined_body)
     kaller_sexp = Sexp.for klass, kaller
 
+    replace_block_pass kaller_sexp, kallee
+
+    replace_fcalls kaller_sexp, kallee, vars, block_var, defaults, inlined_body
+
+    kaller_ruby = RubyToRuby.new.process kaller_sexp
+
+    klass.class_eval kaller_ruby
+
+  rescue SyntaxError, Inliner::Error => e
+    self.class.log "Error inlining #{klass} #{kallee} into #{kaller}:\n\t"
+    self.class.log e.message
+    self.class.log "###\n#{kaller_ruby}\n###" if SyntaxError === e
+  end
+
+  def replace_block_pass(kaller_sexp, kallee)
+    kaller_sexp.each_of_type(:block_pass) do |block_pass|
+      fcall = block_pass.fcall
+      next unless fcall[1] == kallee
+
+      block_var = s(:block_arg, block_pass[1])
+
+      fcall << block_var
+
+      block_pass.replace fcall
+    end
+  end
+
+  def replace_fcalls(kaller_sexp, kallee,
+                     vars, block_var, defaults, inlined_body)
     kaller_sexp.each_of_type(:fcall) do |fcall|
       next unless fcall[1] == kallee
 
-      fcall_args = fcall[2]
+      fcall_args = fcall[2] || []
 
-      if vars.length > fcall_args.length then
-        defaults = defaults.dup
+      case fcall_args.first 
+      when :array then
+        if vars.length > fcall_args.length then
+          defaults = defaults.dup
 
-        until vars.length == fcall_args.length
-          fcall_args << defaults.pop.last
+          fcall_args << defaults.pop.last until vars.length == fcall_args.length
         end
+      when :argscat, :block_arg then
+        # ignore
+      else
+        raise Error, "unknown fcall argument node #{fcall[2].first}"
       end
 
-      callee_vars = vars.length - 1
+      block_arg = fcall.block_arg(true)
+      block_arg = block_arg.last if block_arg
 
-      fcall_args = fcall[2]
+      var_masgn = nil
+      if vars.length > 1 then
+        var_masgn = s(:masgn)
 
-      fcall_vars = fcall_args.length - 1
+        if vars.length == 1 then
+          var_masgn << vars
+        else
+          star_var = vars.pop if vars.last.to_s =~ /\*/
+          var_masgn << vars
+          if star_var then
+            star_var[-1] = star_var.last.to_s.sub('*', '').intern
+            var_masgn << star_var
+          end
+        end
 
-      var_masgn = s(:masgn, vars, fcall[2])
+        var_masgn << fcall_args
+      end
 
-      inlined = s(:block, var_masgn, inlined_body)
+      block_asgn = block_var << block_arg if block_var and block_arg
+
+      inlined = s(:block, var_masgn, block_asgn, inlined_body)
 
       fcall.replace inlined
     end
-
-    kaller_sexp
   end
 
   def rewrite_defn(exp)
@@ -235,6 +307,9 @@ static unsigned long threshold = 0;"
             frame = frame->prev;
 
           if (frame->self != self)
+            goto finish;
+
+          if (T_ICLASS == rb_type(klass))
             goto finish;
 
           if (!frame->last_func)

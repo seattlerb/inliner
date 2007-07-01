@@ -14,12 +14,22 @@ class TestInliner < Test::Unit::TestCase
       v + 5
     end
 
-    def caller_varargs
-      callee_varargs 1
+    def caller_blockarg
+      block = proc do |x| x + 1 end
+      callee_blockarg(&block)
     end
 
-    def callee_varargs(a, b = 2)
-      a + b
+    def callee_blockarg(&block)
+      1.times(&block)
+    end
+
+    def caller_nasty
+      block = proc do |x| x + 1 end
+      callee_nasty(1, 2, *[3, 4], &block)
+    end
+
+    def callee_nasty(a, b = nil, *c, &block)
+      1.times(&block)
     end
 
     def caller_starargs
@@ -28,6 +38,30 @@ class TestInliner < Test::Unit::TestCase
 
     def callee_starargs(*args)
       args
+    end
+
+    def caller_varargs
+      callee_varargs 1
+    end
+
+    def callee_varargs(a, b = 2)
+      a + b
+    end
+
+    # unsupported/error
+
+    def caller_block
+      callee_block 5 do |x| x + 1 end
+    end
+
+    def callee_block(v)
+      v = v * 2
+      w = yield v
+      w * 2
+    end
+
+    def callee_return
+      return 5
     end
   end
 
@@ -42,7 +76,7 @@ class TestInliner < Test::Unit::TestCase
   end
 
   def test_extract_expression
-    args, defaults, body_expr =
+    args, block_arg, defaults, body_expr =
       @processor.extract_expression(InlineTarget, :callee)
 
     assert_equal s(:array, s(:lasgn, :inline_callee_v)), args
@@ -58,8 +92,80 @@ class TestInliner < Test::Unit::TestCase
     assert_equal expected, body_expr
   end
 
+  def test_extract_expression_block
+    e = assert_raise Inliner::Error do
+      @processor.extract_expression(InlineTarget, :callee_block)
+    end
+
+    assert_equal "yield gets slower", e.message
+  end
+
+  def test_extract_expression_blockarg
+    args, block_arg, defaults, body_expr =
+      @processor.extract_expression(InlineTarget, :callee_blockarg)
+
+    assert_equal s(:array), args
+
+    assert_equal s(:lasgn, :inline_callee_blockarg_block), block_arg
+
+    expected = s(:block,
+                 s(:block_pass,
+                   s(:lvar, :inline_callee_blockarg_block),
+                   s(:call, s(:lit, 1), :times)))
+
+    assert_equal s(), defaults
+
+    assert_equal expected, body_expr
+  end
+
+  def test_extract_expression_nasty
+    args, block_arg, defaults, body_expr =
+      @processor.extract_expression(InlineTarget, :callee_nasty)
+
+    expected_args = s(:array,
+                      s(:lasgn, :inline_callee_nasty_a),
+                      s(:lasgn, :inline_callee_nasty_b),
+                      s(:lasgn, :"*inline_callee_nasty_c"))
+    assert_equal expected_args, args
+
+    assert_equal s(:lasgn, :inline_callee_nasty_block), block_arg
+
+    assert_equal s(:block, s(:lasgn, :b, s(:nil))), defaults
+
+    expected = s(:block,
+                s(:block_pass,
+                 s(:lvar, :inline_callee_nasty_block),
+                 s(:call, s(:lit, 1), :times)))
+
+    assert_equal expected, body_expr
+  end
+
+  def test_extract_expression_return
+    e = assert_raise Inliner::Error do
+      @processor.extract_expression(InlineTarget, :callee_return)
+    end
+
+    assert_equal "return unsupported", e.message
+  end
+
+  def test_extract_expression_starargs
+    args, block_arg, defaults, body_expr =
+      @processor.extract_expression(InlineTarget, :callee_starargs)
+
+    expected_args = s(:array,
+                      s(:lasgn, :"*inline_callee_starargs_args"))
+    assert_equal expected_args, args
+
+    assert_equal s(), defaults
+
+    expected = s(:block,
+                 s(:lvar, :inline_callee_starargs_args))
+
+    assert_equal expected, body_expr
+  end
+
   def test_extract_expression_varargs
-    args, defaults, body_expr =
+    args, block_arg, defaults, body_expr =
       @processor.extract_expression(InlineTarget, :callee_varargs)
 
     expected_args = s(:array,
@@ -74,22 +180,6 @@ class TestInliner < Test::Unit::TestCase
                    s(:lvar, :inline_callee_varargs_a),
                    :+,
                    s(:array, s(:lvar, :inline_callee_varargs_b))))
-
-    assert_equal expected, body_expr
-  end
-
-  def test_extract_expression_starargs
-    args, defaults, body_expr =
-      @processor.extract_expression(InlineTarget, :callee_starargs)
-
-    expected_args = s(:array,
-                      s(:lasgn, :"*inline_callee_starargs_args"))
-    assert_equal expected_args, args
-
-    assert_equal s(), defaults
-
-    expected = s(:block,
-                 s(:lvar, :inline_callee_starargs_args))
 
     assert_equal expected, body_expr
   end
@@ -110,6 +200,94 @@ class TestInliner < Test::Unit::TestCase
 
     it = InlineTarget.new
     assert_equal expected, it.method(:caller).to_sexp
+  end
+
+  def test_inline_into_blockarg
+    expected = [:defn, :caller_blockarg,
+      [:scope,
+        [:block,
+          [:args],
+            [:lasgn, :block,
+              [:iter,
+                [:fcall, :proc],
+                [:dasgn_curr, :x],
+                [:call, [:dvar, :x], :+, [:array, [:lit, 1]]]]],
+            [:block,
+              [:lasgn, :inline_callee_blockarg_block, [:lvar, :block]],
+              [:block_pass,
+                [:lvar, :inline_callee_blockarg_block,],
+                [:call, [:lit, 1], :times]]]]]]
+
+    @processor.inline_into InlineTarget, :caller_blockarg, :callee_blockarg
+
+    it = InlineTarget.new
+
+    assert_equal expected, it.method(:caller_blockarg).to_sexp
+  end
+
+  def test_inline_into_error
+    expected = [:defn, :caller_block,
+      [:scope,
+        [:block,
+          [:args],
+          [:iter,
+            [:fcall, :callee_block, [:array, [:lit, 5]]],
+            [:dasgn_curr, :x],
+            [:call, [:dvar, :x], :+, [:array, [:lit, 1]]]]]]]
+
+    @processor.inline_into InlineTarget, :caller_block, :callee_block
+
+    it = InlineTarget.new
+    assert_equal expected, it.method(:caller_block).to_sexp
+  end
+
+  def test_inline_into_nasty
+    expected = [:defn, :caller_nasty,
+      [:scope,
+        [:block,
+          [:args],
+          [:lasgn, :block,
+            [:iter,
+              [:fcall, :proc],
+              [:dasgn_curr, :x],
+              [:call, [:dvar, :x], :+, [:array, [:lit, 1]]]]],
+          [:block,
+            [:masgn,
+              [:array,
+                [:lasgn, :inline_callee_nasty_a],
+                [:lasgn, :inline_callee_nasty_b]],
+              [:lasgn, :inline_callee_nasty_c],
+              [:argscat,
+                [:array, [:lit, 1], [:lit, 2]],
+                [:array, [:lit, 3], [:lit, 4]]]],
+            [:lasgn, :inline_callee_nasty_block, [:lvar, :block]],
+            [:block_pass,
+              [:lvar, :inline_callee_nasty_block],
+              [:call, [:lit, 1], :times]]]]]]
+
+
+    @processor.inline_into InlineTarget, :caller_nasty, :callee_nasty
+
+    it = InlineTarget.new
+
+    assert_equal expected, it.method(:caller_nasty).to_sexp
+  end
+
+  def test_inline_into_starargs
+    expected = [:defn, :caller_starargs,
+      [:scope,
+        [:block,
+          [:args],
+          [:block,
+            [:masgn,
+              [:lasgn, :inline_callee_starargs_args],
+              [:array, [:lit, 1], [:lit, 2]]],
+            [:lvar, :inline_callee_starargs_args]]]]]
+
+    @processor.inline_into InlineTarget, :caller_starargs, :callee_starargs
+
+    it = InlineTarget.new
+    assert_equal expected, it.method(:caller_starargs).to_sexp
   end
 
   def test_inline_into_varargs
@@ -134,21 +312,47 @@ class TestInliner < Test::Unit::TestCase
     assert_equal expected, it.method(:caller_varargs).to_sexp
   end
 
-  def test_inline_into_starargs
-    expected = [:defn, :caller_starargs,
-      [:scope,
-        [:block,
-          [:args],
-          [:block,
-            [:masgn,
-              [:lasgn, :inline_callee_starargs_args],
-              [:array, [:lit, 1], [:lit, 2]]],
-            [:lvar, :inline_callee_starargs_args]]]]]
+  def test_replace_block_pass
+    sexp = Sexp.for InlineTarget, :caller_blockarg
 
-    @processor.inline_into InlineTarget, :caller_starargs, :callee_starargs
+    @processor.replace_block_pass sexp, :callee_blockarg
 
-    it = InlineTarget.new
-    assert_equal expected, it.method(:caller_starargs).to_sexp
+    expected = s(:defn, :caller_blockarg,
+                 s(:scope,
+                   s(:block,
+                     s(:args),
+                     s(:lasgn, :block,
+                       s(:iter,
+                         s(:fcall, :proc),
+                         s(:dasgn_curr, :x),
+                         s(:call, s(:dvar, :x), :+, s(:array, s(:lit, 1))))),
+                     s(:fcall, :callee_blockarg,
+                       s(:block_arg, s(:lvar, :block))))))
+
+    assert_equal expected, sexp
+  end
+
+  def test_replace_block_pass_nasty
+    sexp = Sexp.for InlineTarget, :caller_nasty
+
+    @processor.replace_block_pass sexp, :callee_nasty
+
+    expected = s(:defn, :caller_nasty,
+                 s(:scope,
+                   s(:block,
+                     s(:args),
+                     s(:lasgn, :block,
+                       s(:iter,
+                         s(:fcall, :proc),
+                         s(:dasgn_curr, :x),
+                         s(:call, s(:dvar, :x), :+, s(:array, s(:lit, 1))))),
+                     s(:fcall, :callee_nasty,
+                       s(:argscat,
+                         s(:array, s(:lit, 1), s(:lit, 2)),
+                         s(:array, s(:lit, 3), s(:lit, 4))),
+                       s(:block_arg, s(:lvar, :block))))))
+
+    assert_equal expected, sexp
   end
 
   def test_replace_fcalls
@@ -159,8 +363,8 @@ class TestInliner < Test::Unit::TestCase
                    :+,
                    s(:array, s(:lit, 5))))
 
-    inlined_sexp = @processor.replace_fcalls(InlineTarget, :caller, :callee,
-                                             vars, s(), body_exp)
+    kaller_sexp = Sexp.for InlineTarget, :caller
+    @processor.replace_fcalls kaller_sexp, :callee, vars, nil, s(), body_exp
 
     expected = s(:defn, :caller,
                  s(:scope,
@@ -172,6 +376,7 @@ class TestInliner < Test::Unit::TestCase
                          s(:masgn,
                            s(:array, s(:lasgn, :inline_callee_v)),
                            s(:array, s(:lvar, :v1))),
+                         nil,
                          s(:block,
                            s(:call,
                              s(:lvar, :inline_callee_v),
@@ -182,7 +387,118 @@ class TestInliner < Test::Unit::TestCase
                        :+,
                        s(:array, s(:lit, 2))))))
 
-    assert_equal expected, inlined_sexp
+    assert_equal expected, kaller_sexp
+  end
+
+  def test_replace_fcalls_blockarg
+    vars = s(:array)
+    defaults = s()
+    block_var = s(:lasgn, :inline_callee_blockarg_block)
+    body_exp = s(:block,
+                 s(:block_pass,
+                   s(:lvar, :inline_callee_blockarg_block),
+                   s(:call, s(:lit, 1), :times)))
+
+    kaller_sexp = Sexp.for InlineTarget, :caller_blockarg
+
+    @processor.replace_block_pass kaller_sexp, :callee_blockarg # HACK lazy
+
+    @processor.replace_fcalls kaller_sexp, :callee_blockarg,
+                              vars, block_var, defaults, body_exp
+
+    expected = s(:defn, :caller_blockarg,
+                 s(:scope,
+                   s(:block,
+                     s(:args),
+                     s(:lasgn, :block,
+                       s(:iter,
+                         s(:fcall, :proc),
+                         s(:dasgn_curr, :x),
+                         s(:call,
+                           s(:dvar, :x),
+                           :+,
+                           s(:array, s(:lit, 1))))),
+                     s(:block,
+                       nil,
+                       s(:lasgn, :inline_callee_blockarg_block,
+                         s(:lvar, :block)),
+                       s(:block,
+                         s(:block_pass,
+                           s(:lvar, :inline_callee_blockarg_block),
+                           s(:call, s(:lit, 1), :times)))))))
+
+    assert_equal expected, kaller_sexp
+  end
+
+  def test_replace_fcalls_nasty
+    vars = s(:array,
+             s(:lasgn, :inline_callee_nasty_a),
+             s(:lasgn, :inline_callee_nasty_b),
+             s(:lasgn, :"*inline_callee_nasty_c"))
+    defaults = s(:block, s(:lasgn, :b, s(:nil)))
+    block_var = s(:lasgn, :inline_callee_nasty_block)
+    body_exp = s(:block,
+                 s(:block_pass,
+                   s(:lvar, :inline_callee_nasty_block),
+                   s(:call, s(:lit, 1), :times)))
+
+    kaller_sexp = Sexp.for InlineTarget, :caller_nasty
+
+    @processor.replace_block_pass kaller_sexp, :callee_nasty
+
+    @processor.replace_fcalls kaller_sexp, :callee_nasty,
+                              vars, block_var, defaults, body_exp
+
+    expected = s(:defn, :caller_nasty,
+                 s(:scope,
+                   s(:block,
+                     s(:args),
+                     s(:lasgn, :block,
+                       s(:iter,
+                         s(:fcall, :proc),
+                         s(:dasgn_curr, :x),
+                         s(:call, s(:dvar, :x), :+, s(:array, s(:lit, 1))))),
+                     s(:block,
+                       s(:masgn,
+                         s(:array,
+                           s(:lasgn, :inline_callee_nasty_a),
+                           s(:lasgn, :inline_callee_nasty_b)),
+                         s(:lasgn, :inline_callee_nasty_c),
+                         s(:argscat,
+                           s(:array, s(:lit, 1), s(:lit, 2)),
+                           s(:array, s(:lit, 3), s(:lit, 4)))),
+                       s(:lasgn, :inline_callee_nasty_block, s(:lvar, :block)),
+                       s(:block,
+                         s(:block_pass,
+                           s(:lvar, :inline_callee_nasty_block),
+                           s(:call, s(:lit, 1), :times)))))))
+
+    assert_equal expected, kaller_sexp
+  end
+
+  def test_replace_fcalls_starargs
+    vars = s(:array,
+             s(:lasgn, :"*inline_callee_starargs_args"))
+    defaults = s()
+    body_exp = s(:block,
+                 s(:lvar, :inline_callee_starargs_args))
+
+    kaller_sexp = Sexp.for InlineTarget, :caller_starargs
+
+    @processor.replace_fcalls kaller_sexp, :callee_starargs,
+                              vars, nil, defaults, body_exp
+
+    expected = s(:defn, :caller_starargs,
+                 s(:scope,
+                   s(:block, s(:args),
+                     s(:block,
+                      s(:masgn,
+                       s(:array), s(:lasgn, :inline_callee_starargs_args),
+                       s(:array, s(:lit, 1), s(:lit, 2))),
+                      nil,
+                      s(:block, s(:lvar, :inline_callee_starargs_args))))))
+
+    assert_equal expected, kaller_sexp
   end
 
   def test_replace_fcalls_varargs
@@ -196,9 +512,9 @@ class TestInliner < Test::Unit::TestCase
                    :+,
                    s(:array, s(:lvar, :inline_callee_varargs_b))))
 
-    inlined_sexp = @processor.replace_fcalls(InlineTarget, :caller_varargs,
-                                             :callee_varargs,
-                                             vars, defaults, body_exp)
+    kaller_sexp = Sexp.for InlineTarget, :caller_varargs
+    @processor.replace_fcalls kaller_sexp, :callee_varargs,
+                              vars, nil, defaults, body_exp
 
     expected = s(:defn, :caller_varargs,
                  s(:scope,
@@ -209,36 +525,14 @@ class TestInliner < Test::Unit::TestCase
                         s(:lasgn, :inline_callee_varargs_a),
                         s(:lasgn, :inline_callee_varargs_b)),
                        s(:array, s(:lit, 1), s(:lit, 2))),
+                       nil,
                        s(:block,
                          s(:call,
                            s(:lvar, :inline_callee_varargs_a),
                            :+,
                            s(:array, s(:lvar, :inline_callee_varargs_b))))))))
 
-    assert_equal expected, inlined_sexp
-  end
-
-  def test_replace_fcalls_starargs
-    vars = s(:array,
-             s(:lasgn, :"*inline_callee_starargs_args"))
-    defaults = s()
-    body_exp = s(:block,
-                 s(:lvar, :inline_callee_starargs_args))
-
-    inlined_sexp = @processor.replace_fcalls(InlineTarget, :caller_starargs,
-                                             :callee_starargs,
-                                             vars, defaults, body_exp)
-
-    expected = s(:defn, :caller_starargs,
-                 s(:scope,
-                   s(:block, s(:args),
-                     s(:block,
-                      s(:masgn,
-                       s(:array, s(:lasgn, :"*inline_callee_starargs_args")),
-                       s(:array, s(:lit, 1), s(:lit, 2))),
-                      s(:block, s(:lvar, :inline_callee_starargs_args))))))
-
-    assert_equal expected, inlined_sexp
+    assert_equal expected, kaller_sexp
   end
 
   def test_rewrite_defn_dasgn
