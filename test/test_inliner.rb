@@ -32,6 +32,14 @@ class TestInliner < Test::Unit::TestCase
       1.times(&block)
     end
 
+    def caller_rescue
+      callee_rescue
+    end
+
+    def callee_rescue
+    rescue ArgumentError
+    end
+
     def caller_starargs
       callee_starargs 1, 2
     end
@@ -136,6 +144,23 @@ class TestInliner < Test::Unit::TestCase
                 s(:block_pass,
                  s(:lvar, :inline_callee_nasty_block),
                  s(:call, s(:lit, 1), :times)))
+
+    assert_equal expected, body_expr
+  end
+
+  def test_extract_expression_rescue
+    args, block_arg, defaults, body_expr =
+      @processor.extract_expression(InlineTarget, :callee_rescue)
+
+    assert_equal s(:array), args
+
+    assert_equal s(), defaults
+
+    expected = s(:begin,
+                 s(:rescue,
+                   s(:resbody,
+                     s(:array,
+                       s(:const, :ArgumentError)))))
 
     assert_equal expected, body_expr
   end
@@ -310,6 +335,16 @@ class TestInliner < Test::Unit::TestCase
 
     it = InlineTarget.new
     assert_equal expected, it.method(:caller_varargs).to_sexp
+  end
+
+  def test_rename
+    @processor.defn_name = :foo
+    assert_equal :inline_foo_arg, @processor.rename(:arg),
+                 "rename #{@processor.defn_name}"
+
+    @processor.defn_name = :"foo?"
+    assert_equal :inline_foo_eh_arg, @processor.rename(:arg),
+                 "rename #{@processor.defn_name}"
   end
 
   def test_replace_block_pass
@@ -583,6 +618,27 @@ class TestInliner < Test::Unit::TestCase
             s(:scope,
               s(:block,
                 s(:lasgn, :inline_thing_var, s(:lit, 5)))))
+
+    assert_equal out, @processor.rewrite(inn)
+  end
+
+  def test_rewrite_defn_masgn_lasgn
+    inn = s(:defn, :thing,
+            s(:scope,
+              s(:block, s(:args),
+                s(:masgn,
+                  s(:array,
+                    s(:lasgn, :a), s(:lasgn, :b)),
+                  s(:array,
+                    s(:lit, 1), s(:lit, 2))))))
+    out = s(:defn, :thing, s(:args),
+            s(:scope,
+              s(:block,
+                s(:masgn,
+                  s(:array,
+                    s(:lasgn, :inline_thing_a), s(:lasgn, :inline_thing_b)),
+                  s(:array,
+                    s(:lit, 1), s(:lit, 2))))))
 
     assert_equal out, @processor.rewrite(inn)
   end

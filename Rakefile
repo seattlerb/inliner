@@ -15,6 +15,7 @@ Hoe.new('Inliner', Inliner::VERSION) do |p|
 
   p.extra_deps << ['ruby2ruby', '>= 1.1.6']
   p.extra_deps << ['RubyInline', '>= 3.6.3']
+  p.extra_deps << ['ZenTest', '>= 3.6.1']
 end
 
 # vim: syntax=Ruby

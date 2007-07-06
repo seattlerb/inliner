@@ -1,7 +1,10 @@
 require 'rubygems'
 require 'ruby2ruby'
+require 'zentest_mapping'
 
 class Inliner < RubyToRuby
+
+  include ZenTestMapping
 
   class Error < RuntimeError; end
 
@@ -12,15 +15,14 @@ class Inliner < RubyToRuby
 
   attr_accessor :defn_name
 
-  @@signature = :bogus
-  @@threshold = 500
-  @@sacred = {
-    Sexp => true,
-  }
-  @@skip = Hash.new(false)
   # { klass => { [kaller, kallee] => count } }
   @@data = Hash.new { |h,klass| h[klass] = Hash.new(0) }
   @@debug = false
+  @@order = []
+  @@sacred = {}
+  @@signature = :bogus
+  @@skip = {}
+  @@threshold = 500
 
   def self.data
     @@data
@@ -48,18 +50,21 @@ class Inliner < RubyToRuby
     log "Inliner threshold tripped for #{klass} #{kallee} -> #{kaller}"
 
     begin
-      new.inline_into klass, kaller, kallee
+      inlined = new.inline_into klass, kaller, kallee
+      @@skip[signature] = inlined
+      @@order << signature if inlined
     rescue Exception => e
+      @@skip[signature] = false
       log "Failed to inline #{klass} #{kallee} -> #{kaller}"
       log "Exception = #{e.class}, message = #{e.message}"
     end
-
-    @@skip[signature] = true
   end
 
   def self.log(message)
     $stderr.puts message if debug
   end
+
+  def self.order() @@order end
 
   def self.sacred
     @@sacred
@@ -67,6 +72,10 @@ class Inliner < RubyToRuby
 
   def self.signature
     @@signature
+  end
+
+  def self.skip
+    @@skip
   end
 
   def self.start_inlining
@@ -81,14 +90,16 @@ class Inliner < RubyToRuby
     log @@data.inspect
   end
 
+  def self.threshold() @@threshold end
+  def self.threshold=(v) @@threshold = v end
+
   def initialize
     super
-    @renames = {}
     @defn_name = nil
   end
 
   def extract_expression(klass, kallee)
-    kallee_sexp = Sexp.for klass, kallee
+    kallee_sexp = Sexp.for klass, kallee, true
 
     # HACK Sexp#=~ sucks
     kallee_sexp.each_of_type(:yield) { raise Error, "yield gets slower" }
@@ -119,26 +130,51 @@ class Inliner < RubyToRuby
     body_defn = rewrite kallee_sexp
     body_expr = body_defn.scope.block
 
+    body_expr[0] = :begin if body_expr.rescue
+
     return args, block_arg, defaults, body_expr
   end
 
   def inline_into(klass, kaller, kallee)
+    raise Error, "can't handle anonymous class #{klass.inspect}" if
+      klass.name.empty?
+
     vars, block_var, defaults, inlined_body = extract_expression klass, kallee
 
-    kaller_sexp = Sexp.for klass, kaller
+    kaller_sexp = Sexp.for klass, kaller, true
+
+    raise Error, "couldn't extract sexp for #{klass} #{kaller}" if
+      kaller_sexp == s(nil)
 
     replace_block_pass kaller_sexp, kallee
 
     replace_fcalls kaller_sexp, kallee, vars, block_var, defaults, inlined_body
 
+    saved_sexp = kaller_sexp.deep_clone
+
     kaller_ruby = RubyToRuby.new.process kaller_sexp
 
     klass.class_eval kaller_ruby
 
+    true
+
   rescue SyntaxError, Inliner::Error => e
-    self.class.log "Error inlining #{klass} #{kallee} into #{kaller}:\n\t"
-    self.class.log e.message
-    self.class.log "###\n#{kaller_ruby}\n###" if SyntaxError === e
+    self.class.log "Error inlining #{klass} #{kallee} into #{kaller}:"
+    self.class.log "\t#{e.message}"
+    if SyntaxError === e then
+      self.class.log "### caller\n#{RubyToRuby.new.process Sexp.for(klass, kaller)}"
+      self.class.log "### callee\n#{RubyToRuby.new.process Sexp.for(klass, kallee)}"
+      self.class.log "### sexp\n#{saved_sexp.inspect}"
+      self.class.log "### ruby\n#{kaller_ruby}"
+    end
+
+    false
+  end
+
+  def rename(var)
+    escaped = normal_to_test @defn_name.to_s
+    escaped = escaped.sub(/test_/, '')
+    "inline_#{escaped}_#{var}".intern
   end
 
   def replace_block_pass(kaller_sexp, kallee)
@@ -161,17 +197,17 @@ class Inliner < RubyToRuby
 
       fcall_args = fcall[2] || []
 
-      case fcall_args.first 
+      case fcall_args.first
       when :array then
         if vars.length > fcall_args.length then
           defaults = defaults.dup
 
           fcall_args << defaults.pop.last until vars.length == fcall_args.length
         end
-      when :argscat, :block_arg then
+      when :argscat, :block_arg, :splat then
         # ignore
       else
-        raise Error, "unknown fcall argument node #{fcall[2].first}"
+        raise Error, "unknown fcall argument node #{fcall[2].first} in #{fcall.inspect}"
       end
 
       block_arg = fcall.block_arg(true)
@@ -226,21 +262,21 @@ class Inliner < RubyToRuby
     name = rename exp.shift
     val = exp.shift
 
-    return s(:dasgn, name, val)
+    s(:dasgn, name, val)
   end
 
   def rewrite_dasgn_curr(exp)
     exp.shift # :dasgn_curr
     name = rename exp.shift
 
-    return s(:dasgn_curr, name)
+    s(:dasgn_curr, name)
   end
 
   def rewrite_dvar(exp)
     exp.shift # :dvar
     name = rename exp.shift
 
-    return s(:dvar, name)
+    s(:dvar, name)
   end
 
   def rewrite_lasgn(exp)
@@ -248,18 +284,16 @@ class Inliner < RubyToRuby
     name = rename exp.shift
     val = exp.shift
 
-    return s(:lasgn, name, val)
+    lasgn = s(:lasgn, name)
+    lasgn << val if val
+    lasgn
   end
 
   def rewrite_lvar(exp)
     exp.shift # :lvar
     name = rename exp.shift
 
-    return s(:lvar, name)
-  end
-
-  def rename(var)
-    @renames[var] ||= "inline_#{@defn_name}_#{var}".intern
+    s(:lvar, name)
   end
 
   ############################################################
