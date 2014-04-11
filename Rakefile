@@ -5,7 +5,6 @@ require 'hoe'
 require './lib/inliner.rb'
 
 Hoe.new('Inliner', Inliner::VERSION) do |p|
-  p.rubyforge_name = 'seattlerb'
   p.author = 'Eric Hodel'
   p.email = 'drbrain@segment7.net'
   # p.summary = 'FIX'
